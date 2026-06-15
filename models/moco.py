@@ -21,12 +21,12 @@ class Moco(nn.Module):
         K=32 * 128,
         m=0.999,
         T=0.07,
-        max_samples=512,
+        max_samples=None,
         eps=1e-8,
     ):
         super(Moco, self).__init__()
         self.T = T
-        self.max_samples = max_samples
+        self.max_samples = K if max_samples is None else max_samples
         self.eps = eps
 
     def _flatten_spectra(self, x):
