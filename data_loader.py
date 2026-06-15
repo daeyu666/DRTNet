@@ -10,6 +10,10 @@ import hdf5storage
 
 
 def build_datasets(root, dataset, size, n_select_bands, scale_ratio):
+    size = int(size)
+    n_select_bands = int(n_select_bands)
+    scale_ratio = int(scale_ratio)
+
     # Imageh preprocessing, normalization for the pretrained resnet
     if dataset == 'Pavia':
         img = scio.loadmat(root + '/' + 'Pavia.mat')['pavia']*1.0
@@ -44,10 +48,10 @@ def build_datasets(root, dataset, size, n_select_bands, scale_ratio):
     print(img.shape)
 
     # throwing up the edge
-    w_edge = img.shape[0]//scale_ratio*scale_ratio-img.shape[0]
-    h_edge = img.shape[1]//scale_ratio*scale_ratio-img.shape[1]
-    w_edge = -1  if w_edge==0  else  w_edge
-    h_edge = -1  if h_edge==0  else  h_edge
+    w_edge = img.shape[0] // scale_ratio * scale_ratio - img.shape[0]
+    h_edge = img.shape[1] // scale_ratio * scale_ratio - img.shape[1]
+    w_edge = -1 if w_edge == 0 else int(w_edge)
+    h_edge = -1 if h_edge == 0 else int(h_edge)
     img = img[:w_edge, :h_edge, :]
 
     # cropping area
@@ -62,7 +66,7 @@ def build_datasets(root, dataset, size, n_select_bands, scale_ratio):
     gap_bands = n_bands / (n_select_bands-1.0)
     test_ref = img_copy[w_str:w_end, h_str:h_end, :].copy()
     test_lr = cv2.GaussianBlur(test_ref, (5,5), 2)
-    test_lr = cv2.resize(test_lr, (size//scale_ratio, size//scale_ratio))
+    test_lr = cv2.resize(test_lr, (size // scale_ratio, size // scale_ratio))
 
     test_hr = test_ref[:,:,0][:,:,np.newaxis]
     for i in range(1, n_select_bands-1):
@@ -73,7 +77,7 @@ def build_datasets(root, dataset, size, n_select_bands, scale_ratio):
     img[w_str:w_end,h_str:h_end,:] = 0
     train_ref = img
     train_lr = cv2.GaussianBlur(train_ref, (5,5), 2)
-    train_lr = cv2.resize(train_lr, (train_lr.shape[1]//scale_ratio, train_lr.shape[0]//scale_ratio))
+    train_lr = cv2.resize(train_lr, (train_lr.shape[1] // scale_ratio, train_lr.shape[0] // scale_ratio))
     train_hr = train_ref[:,:,0][:,:,np.newaxis]
     for i in range(1, n_select_bands-1):
         train_hr = np.concatenate((train_hr, train_ref[:,:,int(gap_bands*i)][:,:,np.newaxis],), axis=2)
@@ -87,4 +91,4 @@ def build_datasets(root, dataset, size, n_select_bands, scale_ratio):
     test_lr = torch.from_numpy(test_lr).permute(2,0,1).unsqueeze(dim=0) 
     test_hr = torch.from_numpy(test_hr).permute(2,0,1).unsqueeze(dim=0) 
 
-    return [train_ref, train_lr, train_hr], [test_ref, test_lr, test_hr]  # train list 、test list
+    return [train_ref, train_lr, train_hr], [test_ref, test_lr, test_hr]
