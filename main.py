@@ -3,7 +3,6 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.optim
 from torch import nn
-from models.MIMO import MIMO
 from models.SSRNET import SSRNET
 from models.SingleCNN import SpatCNN, SpecCNN
 from models.SSFCNN import SSFCNN, ConSSFCNN
@@ -87,6 +86,7 @@ def main():
                               ).cuda()
 
     elif args.arch == 'MIMO':
+        from models.MIMO import MIMO
         model = MIMO(args.n_select_bands, args.n_bands).cuda()
     else:
         raise ValueError('Unsupported architecture: {}'.format(args.arch))
