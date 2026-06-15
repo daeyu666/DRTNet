@@ -15,6 +15,7 @@ HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(os.environ.get("DRTNET_ROOT", HERE.parent)).resolve()
 DATA_ROOT = Path(os.environ.get("DRTNET_DATA_ROOT", PROJECT_ROOT / "data")).resolve()
 RUN_ROOT = Path(os.environ.get("DRTNET_RUN_ROOT", PROJECT_ROOT / "runs" / "paviau_shadow_ablation")).resolve()
+DEFAULT_ARCH = os.environ.get("DRTNET_ARCH", "MCT")
 
 
 def _set_seed(seed: int = 10) -> None:
@@ -34,11 +35,11 @@ def _base_argv(experiment_name: str, arch: str) -> list[str]:
     save_dir.mkdir(parents=True, exist_ok=True)
 
     return [
-        "--root",
+        "-root",
         str(DATA_ROOT),
-        "--dataset",
+        "-dataset",
         "PaviaU",
-        "--arch",
+        "-arch",
         arch,
         "--image_size",
         "128",
@@ -56,6 +57,9 @@ def _base_argv(experiment_name: str, arch: str) -> list[str]:
 
 
 def _patch_no_contrast(main_mod) -> None:
+    if not hasattr(main_mod, "train_contrast"):
+        print("No contrastive training function found; this repository already trains without contrastive learning.")
+        return
     if not hasattr(main_mod, "train"):
         raise RuntimeError("Cannot disable contrastive learning: main.train is not available.")
 
@@ -73,9 +77,6 @@ def _patch_no_contrast(main_mod) -> None:
         epoch,
         n_epochs,
     ):
-        l1 = torch.nn.L1Loss()
-        if torch.cuda.is_available():
-            l1 = l1.cuda()
         return main_mod.train(
             train_list,
             image_size,
@@ -85,7 +86,6 @@ def _patch_no_contrast(main_mod) -> None:
             model,
             optimizer,
             criterion,
-            l1,
             epoch,
             n_epochs,
         )
@@ -138,34 +138,45 @@ def _patch_module_forward_to_single_scale(module) -> None:
 
 
 def _patch_safa_to_single_scale(main_mod) -> None:
-    if not hasattr(main_mod, "MCT_rectangle"):
-        raise RuntimeError("Cannot patch SAFA: main.MCT_rectangle is not available.")
-
-    base_cls = main_mod.MCT_rectangle
+    candidate_names = ["MCT_rectangle", "MCT"]
+    base_cls = None
+    for name in candidate_names:
+        if hasattr(main_mod, name):
+            base_cls = getattr(main_mod, name)
+            break
+    if base_cls is None:
+        print("No MCT/DRT model class found; skipping single-scale SAFA patch.")
+        return
 
     class SingleScaleSAFAMCT(base_cls):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             patched = []
-            for name, module in self.named_modules():
-                signature = "{} {}".format(name, module.__class__.__name__).lower()
-                if "safa" in signature or "scale" in signature and "aggregation" in signature:
+            for module_name, module in self.named_modules():
+                signature = "{} {}".format(module_name, module.__class__.__name__).lower()
+                if "safa" in signature or ("scale" in signature and "aggregation" in signature):
                     module.single_scale = True
                     module.use_multiscale = False
                     module.safa_mode = "single_scale"
                     _patch_module_forward_to_single_scale(module)
-                    patched.append(name or module.__class__.__name__)
+                    patched.append(module_name or module.__class__.__name__)
             self.drtnet_single_scale_safa_modules = patched
-            print("Single-scale SAFA patch modules:", patched if patched else "none found")
+            if patched:
+                print("Single-scale SAFA patch modules:", patched)
+            else:
+                print("No SAFA module found in this repository; single-scale SAFA ablation is not active.")
 
-    main_mod.MCT_rectangle = SingleScaleSAFAMCT
+    if hasattr(main_mod, "MCT_rectangle"):
+        main_mod.MCT_rectangle = SingleScaleSAFAMCT
+    if hasattr(main_mod, "MCT"):
+        main_mod.MCT = SingleScaleSAFAMCT
     os.environ["DRTNET_SAFA_MODE"] = "single_scale"
     os.environ["DRTNET_SINGLE_SCALE_SAFA"] = "1"
 
 
 def run_experiment(
     experiment_name: str,
-    arch: str = "MCT_rectangle",
+    arch: str = DEFAULT_ARCH,
     *,
     disable_contrast: bool = False,
     single_scale_safa: bool = False,
