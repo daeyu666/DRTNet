@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-
+import torch.nn as nn
 
 def calc_ergas(img_tgt, img_fus):
     img_tgt = np.squeeze(img_tgt)
@@ -43,6 +43,33 @@ def calc_sam(img_tgt, img_fus):
 
     sam = AB/(A*B)
     sam = np.arccos(sam)
-    sam = np.mean(sam)*180/3.1415926535
+    sam = np.mean(sam)*180/ (3.1415926535*2)
 
     return sam
+
+class MRAE(nn.Module):
+    def __init__(self):
+        super(MRAE,self).__init__()
+
+    def forward(self,out,ref):
+        assert out.shape==ref.shape
+        error = torch.abs(out - ref ) / ref
+        mrae = torch.mean(error.view(-1))
+        return mrae
+
+def mrae(img_tgt, img_fus ):
+    assert img_tgt.shape == img_fus.shape
+    img_tgt = np.squeeze(img_tgt)
+    img_fus = np.squeeze(img_fus)
+    img_tgt = img_tgt.reshape(img_tgt.shape[0], -1)
+    img_fus = img_fus.reshape(img_fus.shape[0], -1)
+    img_tgt_tensor = torch.from_numpy(img_tgt)  # 将NumPy数组转换为PyTorch张量
+    img_fus_tensor = torch.from_numpy(img_fus)
+
+    img_tgt_tensor += 1e-2
+
+
+    error = torch.abs(img_fus_tensor - img_tgt_tensor) / img_tgt_tensor
+    mrae = torch.mean(error.reshape(-1))
+    return mrae
+
