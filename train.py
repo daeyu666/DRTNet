@@ -8,16 +8,24 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets
 import args_parser
 
+
 def spatial_edge(x):
     edge1 = x[:, :, 0:x.size(2)-1, :] - x[:, :, 1:x.size(2), :]
     edge2 = x[:, :, :, 0:x.size(3)-1] - x[:, :,  :, 1:x.size(3)]
 
     return edge1, edge2
 
+
 def spectral_edge(x):
     edge = x[:, 0:x.size(1)-1, :, :] - x[:, 1:x.size(1), :, :]
 
     return edge
+
+
+def _as_tuple(outputs):
+    if isinstance(outputs, (tuple, list)):
+        return tuple(outputs)
+    return (outputs,)
 
 
 def train(train_list,
@@ -40,8 +48,6 @@ def train(train_list,
     train_lr = F.interpolate(train_ref, scale_factor=1/(scale_ratio*1.0))
     train_hr = train_hr[:, :, h_str:h_str+image_size, w_str:w_str+image_size]
 
-
-
     model.train()
 
     # Set mini-batch dataset
@@ -52,11 +58,14 @@ def train(train_list,
     # Forward, Backward and Optimize
     optimizer.zero_grad()
 
-    out, out_spat, out_spec, edge_spat1, edge_spat2, edge_spec = model(image_lr, image_hr)
-    ref_edge_spat1, ref_edge_spat2 = spatial_edge(image_ref)
-    ref_edge_spec = spectral_edge(image_ref)
+    outputs = _as_tuple(model(image_lr, image_hr))
+    out = outputs[0]
 
-    if 'RNET' in arch:
+    if len(outputs) >= 6 and 'RNET' in arch:
+        out_spat, out_spec, edge_spat1, edge_spat2, edge_spec = outputs[1:6]
+        ref_edge_spat1, ref_edge_spat2 = spatial_edge(image_ref)
+        ref_edge_spec = spectral_edge(image_ref)
+
         loss_fus = criterion(out, image_ref)
         loss_spat = criterion(out_spat, image_ref)
         loss_spec = criterion(out_spec, image_ref)
@@ -66,9 +75,7 @@ def train(train_list,
             loss = loss_spat + loss_spat_edge
         elif arch == 'SpecRNET':
             loss = loss_spec + loss_spec_edge
-        elif arch == 'SSRNET':
-            loss = loss_fus
-        elif arch == 'MCT':
+        else:
             loss = loss_fus
     else:
         loss = criterion(out, image_ref)
@@ -78,14 +85,14 @@ def train(train_list,
 
     # Print log info
     print('Epoch [%d/%d], Loss: %.4f'
-          %(epoch,
-            n_epochs,
-            loss,
-            )
-         )
+          % (epoch,
+             n_epochs,
+             loss,
+             )
+          )
 
     # Write loss to TensorBoard
-    tb_writer.add_scalar('Train-Loss', loss.item(), epoch)  # 记录 train loss
+    tb_writer.add_scalar('Train-Loss', loss.item(), epoch)
 
 
 # 创建 TensorBoard writer

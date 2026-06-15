@@ -4,13 +4,11 @@ import argparse
 def args_parser():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-arch', type=str, default='MCT',
-                        choices=[  # these four models are used for ablation experiments
+    parser.add_argument('-arch', type=str, default='DRTnet',
+                        choices=[
                             'SpatCNN', 'SpecCNN',
                             'SpatRNET', 'SpecRNET',
-                            # the proposed method
-                            'SSRNET', 'MCT',
-                            # these five models are used for comparison experiments
+                            'SSRNET', 'MCT', 'DRTnet',
                             'SSFCNN', 'ConSSFCNN',
                             'TFNet', 'ResTFNet',
                             'MSDCNN'
