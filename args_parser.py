@@ -8,7 +8,7 @@ def args_parser():
                         choices=[
                             'SpatCNN', 'SpecCNN',
                             'SpatRNET', 'SpecRNET',
-                            'SSRNET', 'MCT', 'DRTnet',
+                            'SSRNET', 'MCT', 'DRTnet', 'DRTnet_GSIS', 'no_contrast',
                             'SSFCNN', 'ConSSFCNN',
                             'TFNet', 'ResTFNet',
                             'MSDCNN'
