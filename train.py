@@ -20,7 +20,6 @@ def spectral_edge(x):
 
 
 def mrae_loss(img_fus, img_tgt):
-    # error = torch.abs(img_fus - img_tgt) / img_tgt
     absolute_error = torch.abs(img_fus - img_tgt)
     relative_error = absolute_error / (torch.abs(img_tgt) + 1e-8)
     mrae = torch.mean(relative_error)
@@ -28,7 +27,7 @@ def mrae_loss(img_fus, img_tgt):
 
 
 def train(train_list,
-          image_size,  # 128
+          image_size,
           scale_ratio,
           n_bands,
           arch,
@@ -48,19 +47,11 @@ def train(train_list,
     train_lr = F.interpolate(train_ref, scale_factor=1 / (scale_ratio * 1.0))
     train_hr = train_hr[:, :, h_str:h_str + image_size, w_str:w_str + image_size]
 
-    # model.train()
-
-    # Set mini-batch dataset
     image_lr = to_var(train_lr).detach()
     image_hr = to_var(train_hr).detach()
     image_ref = to_var(train_ref).detach()
 
-    # Forward, Backward and Optimize
     optimizer.zero_grad()
-
-    # out, out_spat, out_spec, edge_spat1, edge_spat2, edge_spec = model(image_lr, image_hr)
-    # ref_edge_spat1, ref_edge_spat2 = spatial_edge(image_ref)
-    # ref_edge_spec = spectral_edge(image_ref)
     out, _ = model(image_lr, image_hr)
 
     if 'RNET' in arch:
@@ -85,13 +76,10 @@ def train(train_list,
             loss.backward()
     else:
         loss = criterion(out, image_ref)
-        # L1 = L1(out, image_ref)
-        loss = loss  # + L1
         loss.backward()
 
     optimizer.step()
 
-    # Print log info
     print('Epoch [%d/%d], Loss: %.4f'
           % (epoch,
              n_epochs,
@@ -104,7 +92,7 @@ def train(train_list,
 
 
 def train_contrast(train_list,
-                   image_size,  # 128
+                   image_size,
                    scale_ratio,
                    n_bands,
                    arch,
@@ -125,43 +113,29 @@ def train_contrast(train_list,
     train_lr = F.interpolate(train_ref, scale_factor=1 / (scale_ratio * 1.0))
     train_hr = train_hr[:, :, h_str:h_str + image_size, w_str:w_str + image_size]
 
-    # model.train()
-
-    # Set mini-batch dataset
     image_lr = to_var(train_lr).detach()
     image_hr = to_var(train_hr).detach()
     image_ref = to_var(train_ref).detach()
 
-    # Forward, Backward and Optimize
     optimizer.zero_grad()
 
     out, x_spec = model(image_lr, image_hr)
-
     E.train()
 
-    x_query = image_lr
-    x_key = image_hr
-    # print('x_query',x_query.shape)
-    # fea,logits, labels = E(x_query, x_key)
-    outs, target = E(x_query, x_key)
-
-
     loss = criterion(out, image_ref)
-    # print("edge_spec, image_ref",edge_spec.shape, image_ref.shape)
-    # loss_spec_edge = criterion(edge_spec, image_ref)
     loss_spec = criterion(x_spec, image_ref)
-    # loss = criterion(out, target)
-    # print(out.shape, target.shape)
-    contrast_loss = loss_contrast(outs, target)
-    loss_ = contrast_loss + loss + loss_spec  # loss_spec_edge
+    contrast_loss = E(out, image_ref, image_hr)
+    loss_total = loss + loss_spec + contrast_loss
 
-    loss_.backward()
+    loss_total.backward()
     optimizer.step()
 
-    # Print log info
-    print('Epoch [%d/%d], Contrast Loss: %.4f'
+    print('Epoch [%d/%d], Loss: %.4f, Spectral Loss: %.4f, CESR Loss: %.4f, Total: %.4f'
           % (epoch,
              n_epochs,
-             loss_,
+             loss,
+             loss_spec,
+             contrast_loss,
+             loss_total,
              )
           )
