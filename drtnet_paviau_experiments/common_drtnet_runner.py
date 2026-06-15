@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(os.environ.get("DRTNET_ROOT", HERE.parent)).resolve()
 DATA_ROOT = Path(os.environ.get("DRTNET_DATA_ROOT", PROJECT_ROOT / "data")).resolve()
 RUN_ROOT = Path(os.environ.get("DRTNET_RUN_ROOT", PROJECT_ROOT / "runs" / "paviau_shadow_ablation")).resolve()
-DEFAULT_ARCH = os.environ.get("DRTNET_ARCH", "MCT")
+DEFAULT_ARCH = os.environ.get("DRTNET_ARCH", "DRTnet")
 
 
 def _set_seed(seed: int = 10) -> None:
@@ -58,7 +58,7 @@ def _base_argv(experiment_name: str, arch: str) -> list[str]:
 
 def _patch_no_contrast(main_mod) -> None:
     if not hasattr(main_mod, "train_contrast"):
-        print("No contrastive training function found; this repository already trains without contrastive learning.")
+        print("No contrastive training function found; this code path is already non-contrastive.")
         return
     if not hasattr(main_mod, "train"):
         raise RuntimeError("Cannot disable contrastive learning: main.train is not available.")
@@ -101,75 +101,81 @@ def _patch_no_contrast(main_mod) -> None:
     main_mod.Moco = NoOpMoco
 
 
-def _select_tensor(items: list[torch.Tensor]) -> torch.Tensor:
-    index = int(os.environ.get("DRTNET_SINGLE_SCALE_INDEX", "-1"))
-    return items[index]
-
-
-def _single_scale_value(value):
-    if torch.is_tensor(value) and value.dim() >= 3:
-        return value
-    if isinstance(value, (list, tuple)):
-        tensors = [item for item in value if torch.is_tensor(item) and item.dim() >= 3]
-        if len(tensors) >= 2:
-            selected = _select_tensor(tensors)
-            return type(value)(selected if torch.is_tensor(item) and item.dim() >= 3 else item for item in value)
-    return value
-
-
-def _patch_module_forward_to_single_scale(module) -> None:
+def _patch_multiscale_pooling_to_single_scale(module) -> None:
     if getattr(module, "_drtnet_single_scale_forward", False):
         return
+    required = [
+        "conv3", "conv2d", "PWconv_pool_in", "PWconv_pool_out",
+        "ca", "sa", "context"
+    ]
+    if not all(hasattr(module, name) for name in required):
+        return
 
-    old_forward = module.forward
+    def forward_single_scale(x):
+        x_res = x
+        data_3d = module.conv3(x)
+        x = module.conv2d(x)
+        x = data_3d + x
+        b, c, h, w = x.shape
 
-    def forward_single_scale(*args, **kwargs):
-        tensor_args = [arg for arg in args if torch.is_tensor(arg) and arg.dim() >= 3]
-        if len(tensor_args) >= 2:
-            selected = _select_tensor(tensor_args)
-            args = tuple(selected if torch.is_tensor(arg) and arg.dim() >= 3 else arg for arg in args)
-        else:
-            args = tuple(_single_scale_value(arg) for arg in args)
-            kwargs = {key: _single_scale_value(value) for key, value in kwargs.items()}
-        return old_forward(*args, **kwargs)
+        x_cbam = x
+        x = module.PWconv_pool_in(x)
+        x_in = x.reshape(b, c, h, w)
+
+        # Current-scale ablation: replace pooled [1, 2, 4, 8] aggregation with
+        # the current-resolution feature only.
+        x_out = module.PWconv_pool_out(x_in)
+        x_out = x_res + x_out
+        x_cbam = x_cbam * module.ca(x_cbam)
+        x_cbam = x_cbam * module.sa(x_cbam)
+        x_weight = module.context(x_out)
+        x_out = x_out + x_in + x_cbam
+        x_out = x_weight * x_out
+        return x_out
 
     module.forward = forward_single_scale
+    module.single_scale = True
+    module.use_multiscale = False
+    module.safa_mode = "single_scale"
     module._drtnet_single_scale_forward = True
 
 
 def _patch_safa_to_single_scale(main_mod) -> None:
-    candidate_names = ["MCT_rectangle", "MCT"]
+    candidate_names = ["DRTnet", "MCT_rectangle", "MCT"]
     base_cls = None
+    selected_name = None
     for name in candidate_names:
         if hasattr(main_mod, name):
             base_cls = getattr(main_mod, name)
+            selected_name = name
             break
     if base_cls is None:
-        print("No MCT/DRT model class found; skipping single-scale SAFA patch.")
+        print("No DRT/MCT model class found; skipping single-scale SAFA patch.")
         return
 
-    class SingleScaleSAFAMCT(base_cls):
+    class SingleScaleDRT(base_cls):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             patched = []
             for module_name, module in self.named_modules():
                 signature = "{} {}".format(module_name, module.__class__.__name__).lower()
-                if "safa" in signature or ("scale" in signature and "aggregation" in signature):
-                    module.single_scale = True
-                    module.use_multiscale = False
-                    module.safa_mode = "single_scale"
-                    _patch_module_forward_to_single_scale(module)
+                if (
+                    "safa" in signature
+                    or "multiscale" in signature
+                    or "multi_scale" in signature
+                    or ("scale" in signature and "pool" in signature)
+                    or ("scale" in signature and "fusion" in signature)
+                    or ("scale" in signature and "aggregation" in signature)
+                ):
+                    _patch_multiscale_pooling_to_single_scale(module)
                     patched.append(module_name or module.__class__.__name__)
             self.drtnet_single_scale_safa_modules = patched
             if patched:
                 print("Single-scale SAFA patch modules:", patched)
             else:
-                print("No SAFA module found in this repository; single-scale SAFA ablation is not active.")
+                print("No SAFA/multiscale pooling module found; single-scale ablation is not active.")
 
-    if hasattr(main_mod, "MCT_rectangle"):
-        main_mod.MCT_rectangle = SingleScaleSAFAMCT
-    if hasattr(main_mod, "MCT"):
-        main_mod.MCT = SingleScaleSAFAMCT
+    setattr(main_mod, selected_name, SingleScaleDRT)
     os.environ["DRTNET_SAFA_MODE"] = "single_scale"
     os.environ["DRTNET_SINGLE_SCALE_SAFA"] = "1"
 
