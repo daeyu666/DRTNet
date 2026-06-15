@@ -1,352 +1,431 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from .basic_blocks import *
+import numpy as np
+import cv2
 import math
+from models.Transformer import TransformerModel
+from models.sync_batchnorm.batchnorm import SynchronizedBatchNorm2d
+from models.CGlayers import CG_Conv2d
+from models.Multiscalepool import MultiScaleFusion_Pooling
+from models.transformer_rectangle import TransformerModel_rectangle
+from models.EMA import ema
+from models.MSA import MSAB
+pool_sizes = [1, 2, 4, 8]
+
+# 通道注意力模块
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc1 = nn.Conv2d(in_planes, in_planes , 1, bias=False) # 11.04 nn.Conv2d(in_planes, in_planes // 16, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes, in_planes , 1, bias=False) # 11.04 nn.Conv2d(in_planes // 16, in_planes, 1, bias=False)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # print(self.fc1(self.avg_pool(x)).shape)  # torch.Size([1, 3, 64, 64])  torch.Size([1, 3, 1, 1])
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
 
-# ===================== 基础工具组件 =====================
+# 空间注意力模块
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # print('x', x.shape)  # c=3,6
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+
+        x = torch.cat([avg_out, max_out], dim=1)
+        # print('x',x.shape)  # c=2
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+
+##################################
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, n_filters, BatchNorm, inp=False):
+        super(DecoderBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels // 4, 1)
+        self.bn1 = BatchNorm(in_channels // 4)
+        self.relu1 = nn.ReLU()
+        self.inp = inp
+
+        self.deconv1 = nn.Conv2d(
+            in_channels // 4, in_channels // 8, (1, 9), padding=(0, 4)
+        )
+        self.deconv2 = nn.Conv2d(
+            in_channels // 4, in_channels // 8, (9, 1), padding=(4, 0)
+        )
+        self.deconv3 = nn.Conv2d(
+            in_channels // 4, in_channels // 8, (9, 1), padding=(4, 0)
+        )
+        self.deconv4 = nn.Conv2d(
+            in_channels // 4, in_channels // 8, (1, 9), padding=(0, 4)
+        )
+
+        self.bn2 = BatchNorm(in_channels // 4 + in_channels // 4)
+        self.relu2 = nn.ReLU()
+        self.conv3 = nn.Conv2d(
+            in_channels // 4 + in_channels // 4, n_filters, 1)
+        self.bn3 = BatchNorm(n_filters)
+        self.relu3 = nn.ReLU()
+
+        self._init_weight()
+
+    def forward(self, x, inp = False):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+        x1 = self.deconv1(x)
+        x2 = self.deconv2(x)
+        x3 = self.h_transform(x)
+        x3 = self.deconv3(x3)
+        x3 = self.inv_h_transform(x3)
+        x4 = self.inv_v_transform(self.deconv4(self.v_transform(x)))
+        x = torch.cat((x1, x2, x3, x4), 1)
+        return x
+
+    def _init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                torch.nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.ConvTranspose2d):
+                torch.nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, SynchronizedBatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+    def h_transform(self, x):
+        shape = x.size()
+        x = torch.nn.functional.pad(x, (0, shape[-1]))
+        x = x.reshape(shape[0], shape[1], -1)[..., :-shape[-1]]
+        x = x.reshape(shape[0], shape[1], shape[2], 2*shape[3]-1)
+        return x
+
+    def inv_h_transform(self, x):
+        shape = x.size()
+        x = x.reshape(shape[0], shape[1], -1).contiguous()
+        x = torch.nn.functional.pad(x, (0, shape[-2]))
+        x = x.reshape(shape[0], shape[1], shape[-2], 2*shape[-2])
+        x = x[..., 0: shape[-2]]
+        return x
+
+
+    def v_transform(self, x):
+        x = x.permute(0, 1, 3, 2)
+        shape = x.size()
+        x = torch.nn.functional.pad(x, (0, shape[-1]))
+        x = x.reshape(shape[0], shape[1], -1)[..., :-shape[-1]]
+        x = x.reshape(shape[0], shape[1], shape[2], 2*shape[3]-1)
+        return x.permute(0, 1, 3, 2)
+
+    def inv_v_transform(self, x):
+        x = x.permute(0, 1, 3, 2)
+        shape = x.size()
+        x = x.reshape(shape[0], shape[1], -1)
+        x = torch.nn.functional.pad(x, (0, shape[-2]))
+        x = x.reshape(shape[0], shape[1], shape[-2], 2*shape[-2])
+        x = x[..., 0: shape[-2]]
+        return x.permute(0, 1, 3, 2)
+
 class GELU(nn.Module):
     def forward(self, x):
         return F.gelu(x)
-
-
-# 可学习位置编码 (论文：嵌入特征图，丰富表征)
-class LearnablePosEmb(nn.Module):
-    def __init__(self, dim, h, w):
-        super().__init__()
-        self.pos_emb = nn.Parameter(torch.randn(1, dim, h, w))
-
-    def forward(self, x):
-        return x + self.pos_emb
-
-
-# 多层感知机 MLP
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
+class ConvMoudle1(nn.Module):
+    def __init__(self, in_channels, u1_channel):
+        super(ConvMoudle1, self).__init__()
+        self.conv1 =  nn.Conv2d(in_channels, 512, 3, 1)
+        self.relu = nn.ReLU()
+        self.pos_emb = nn.Sequential(
+            nn.Conv2d(512, 256, 3, 1, 1, bias=False),
             GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
+            CG_Conv2d(256, 256, kernel_size = 3 ), #nn.Conv2d(256, u1_channel, 3, 1, 1, bias=False),  11.1
         )
-
+        self.conv4 = nn.Sequential(
+            CG_Conv2d(256, 256, kernel_size=3, padding=1),#  nn.Conv2d(u1_channel, u1_channel, 3, 1),  #11.1
+            nn.Conv2d(256,u1_channel,kernel_size=3, padding=1),
+            nn.Upsample(scale_factor=2, mode='nearest')
+        )
     def forward(self, x):
-        return self.net(x)
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.pos_emb(x))  # x pos_emb torch.Size([1, 256, 4, 4])
+        # print('x pos_emb',x.shape)
+        x = self.relu(self.conv4(x))  # x conv4 torch.Size([1, 308, 8, 8])
+        # print('x conv4', x.shape)
 
+        return x
+class CGCconv(nn.Module):
+    def __init__(self,inplanes,planes,dataset,dim,stride=1,downsample=None):  # dim,dim-dead
+        super(CGCconv,self).__init__()
+        # inplanes=1024,planes=512
+        self.conv1= nn.Conv2d(inplanes, dim,kernel_size = 3,padding=1)  #
 
-# ===================== 核心1：矩形交叉注意力 RCA (论文图3.3b) =====================
-# 垂直矩形交叉注意力 V-RCA
-class VerticalRCA(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
-        super().__init__()
-        inner_dim = dim_head * heads
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-
-        # QKV 线性投影 (HSI + MSI 交叉注意力)
-        self.to_q = nn.Linear(dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(dim, inner_dim, bias=False)
-        self.out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
+        self.relu = nn.ReLU(inplace=True)
+        self.pos_emb = nn.Sequential(
+            CG_Conv2d(dim, dim, 3, padding=1),
+            MSAB(dim, dim, 1, dataset),
+            # ema(256),
+            CG_Conv2d(dim, dim, 3, padding=1),  # nn.Conv2d(256, u1_channel, 3, 1, 1, bias=False),  11.1
         )
+        # self.dwconv = DepthWiseConv(planes, planes)
 
-    def forward(self, hsi_feat, msi_feat):
-        B, C, H, W = hsi_feat.shape
-        # 重塑为窗口序列 (垂直矩形窗口)
-        hsi_feat = rearrange(hsi_feat, 'b c h w -> b (h w) c')
-        msi_feat = rearrange(msi_feat, 'b c h w -> b (h w) c')
+        self.conv2 = CG_Conv2d(dim, planes, 1, 1, 0, bias=False)
+        # self.ema = ema(256)
+    def forward(self,x):
+        x1 = self.relu(self.conv1(x))
+        # print('x1', x1.shape)
+        x1 = self.relu(self.pos_emb(x1))
+        # shortcut = self.dwconv(x)
+        # x += shortcut
+        output = self.conv2(x1)
+        # print('out',output.shape)
+        return self.relu(output)
 
-        # Q(MSI), K(HSI), V(HSI) 交叉注意力
-        q = self.to_q(msi_feat)
-        k = self.to_k(hsi_feat)
-        v = self.to_v(hsi_feat)
-
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), (q, k, v))
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        out = attn @ v
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.out(out).reshape(B, C, H, W)
-
-
-# 水平矩形交叉注意力 H-RCA
-class HorizontalRCA(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
-        super().__init__()
-        inner_dim = dim_head * heads
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-
-        self.to_q = nn.Linear(dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(dim, inner_dim, bias=False)
-        self.out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, hsi_feat, msi_feat):
-        B, C, H, W = hsi_feat.shape
-        hsi_feat = rearrange(hsi_feat, 'b c h w -> b (h w) c')
-        msi_feat = rearrange(msi_feat, 'b c h w -> b (h w) c')
-
-        # Q(HSI), K(MSI), V(MSI) 交叉注意力
-        q = self.to_q(hsi_feat)
-        k = self.to_k(msi_feat)
-        v = self.to_v(msi_feat)
-
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), (q, k, v))
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        out = attn @ v
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.out(out).reshape(B, C, H, W)
-
-
-# ===================== 矩形Transformer块 RTB (论文图3.3a) =====================
-class RTB(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, mlp_dim=256, dropout=0.):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-
-        # 双向 RCA 并行
-        self.v_rca = VerticalRCA(dim, heads, dim_head, dropout)
-        self.h_rca = HorizontalRCA(dim, heads, dim_head, dropout)
-        self.mlp = MLP(dim, mlp_dim, dropout)
-
-    def forward(self, hsi_feat, msi_feat):
-        # 残差 + 双向 RCA 融合
-        feat_v = self.v_rca(hsi_feat, msi_feat)
-        feat_h = self.h_rca(hsi_feat, msi_feat)
-        attn_out = feat_v + feat_h  #
-
-        # 层归一化 + MLP + 残差
-        attn_out = self.norm1(attn_out)
-        mlp_out = self.mlp(rearrange(attn_out, 'b c h w -> b (h w) c'))
-        mlp_out = rearrange(mlp_out, 'b (h w) c -> b c h w', h=attn_out.shape[2])
-        out = self.norm2(attn_out + mlp_out)
-        return out
-
-
-# ===================== 核心2：DRT 双分支矩形Transformer模块 =====================
-class DRT(nn.Module):
-    def __init__(self, dim, h, w, depth=3, heads=8, dim_head=64, mlp_dim=256):
-        super().__init__()
-        self.pos_emb = LearnablePosEmb(dim, h, w)  # 可学习位置编码
-        self.layers = nn.ModuleList([RTB(dim, heads, dim_head, mlp_dim) for _ in range(depth)])
-
-    def forward(self, hsi_feat, msi_feat):
-        # 位置编码注入
-        hsi_feat = self.pos_emb(hsi_feat)
-        msi_feat = self.pos_emb(msi_feat)
-
-        # 多层 RTB 迭代
-        for rtb in self.layers:
-            feat = rtb(hsi_feat, msi_feat)
-            hsi_feat = hsi_feat + feat  # 残差融合
-            msi_feat = msi_feat + feat
-
-        # 双分支输出融合
-        return hsi_feat + msi_feat
-
-
-# ===================== 核心3：SAFA 尺度自适应特征聚合模块 =====================
-class SAFA(nn.Module):
-    def __init__(self, dim, compress_ratio=4, groups=4):
-        super().__init__()
-        self.dim = dim
-        self.groups = groups
-
-        # 融合块：空间+通道 池化
-        self.avg_pool_sp = nn.AdaptiveAvgPool2d(1)
-        self.max_pool_sp = nn.AdaptiveMaxPool2d(1)
-        self.avg_pool_ch = nn.AdaptiveAvgPool2d(1)
-        self.max_pool_ch = nn.AdaptiveMaxPool2d(1)
-
-        # 跨维度融合 + 通道压缩
-        self.compress = nn.Sequential(
-            nn.Conv2d(dim * 4, dim // compress_ratio, 1),
-            nn.ReLU(),
-            nn.Conv2d(dim // compress_ratio, dim, 1)
-        )
-
-        # 选择块：分组卷积 + 自适应权重
-        self.group_conv = nn.Conv2d(dim, dim, 3, padding=1, groups=groups)
-        self.weight_a = nn.Parameter(torch.ones(dim))
-        self.weight_b = nn.Parameter(torch.ones(dim))
-        self.final_conv = nn.Sequential(
-            nn.Conv2d(dim, dim, 1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU()
-        )
-
-    def forward(self, x):
-        # 空间/通道 池化
-        avg_sp = self.avg_pool_sp(x)
-        max_sp = self.max_pool_sp(x)
-        avg_ch = self.avg_pool_ch(x.permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
-        max_ch = self.max_pool_ch(x.permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
-
-        #跨维度融合
-        fuse_feat = torch.cat([avg_sp, max_sp, avg_ch, max_ch], dim=1)
-        fuse_feat = self.compress(fuse_feat)
-
-        # Softmax 自适应权重
-        weight = torch.sigmoid(fuse_feat)
-        weight_a = self.weight_a.view(1, -1, 1, 1) * weight
-        weight_b = self.weight_b.view(1, -1, 1, 1) * (1 - weight)
-
-        # 分组卷积 + 特征选择
-        group_feat = self.group_conv(x)
-        out = x * weight_a + group_feat * weight_b
-
-        # 1x1卷积调整通道
-        return self.final_conv(out)
-
-
-# ===================== 核心4：CESR 对比增强光谱恢复机制 + 对比损失 =====================
-class CESR(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.proj = nn.Conv2d(dim, dim, 1)
-
-    # 欧氏距离
-    def euclidean_dist(self, x, y):
-        return torch.sqrt(torch.sum((x - y) ** 2, dim=-1))
-
-    # 划分正负样本
-    def sample_split(self, anchor, hsi_feat, msi_feat, threshold):
-        dist_hsi = self.euclidean_dist(anchor, hsi_feat)
-        pos_mask = dist_hsi < threshold
-        neg_mask = dist_hsi >= threshold
-        return pos_mask, neg_mask
-
-    # 对比损失
-    def contrast_loss(self, anchor, pos, neg, temperature=0.07):
-        sim_pos = F.cosine_similarity(anchor, pos, dim=-1) / temperature
-        sim_neg = F.cosine_similarity(anchor, neg, dim=-1) / temperature
-        loss = -torch.log(torch.exp(sim_pos) / (torch.exp(sim_pos) + torch.exp(sim_neg).sum()))
-        return loss.mean()
-
-    def forward(self, fuse_feat, lr_hsi, hr_msi):
-        anchor = self.proj(fuse_feat).flatten(2)  # 锚点：融合光谱特征
-        hsi_feat = lr_hsi.flatten(2)
-        msi_feat = hr_msi.flatten(2)
-
-        # 自适应阈值
-        dist = self.euclidean_dist(anchor, hsi_feat)
-        threshold = dist.mean()
-
-        # 正负样本
-        pos_mask, neg_mask = self.sample_split(anchor, hsi_feat, msi_feat, threshold)
-        loss = self.contrast_loss(anchor[:, pos_mask], hsi_feat[:, pos_mask], msi_feat[:, neg_mask])
-        return fuse_feat, loss
-
-
-# ===================== 论文损失函数 =====================
-class DRTLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=0.5, gamma=0.1):
-        super().__init__()
-        self.alpha = alpha  # MSE损失权重
-        self.beta = beta  # 光谱重建损失权重
-        self.gamma = gamma  # 对比损失权重
-        self.mse = nn.MSELoss()
-        self.spec_conv = nn.Conv2d(1, 1, 3, padding=1)  # 光谱重建卷积
-
-    def forward(self, pred, gt, cesr_loss):
-        # MSE损失
-        loss_mse = self.mse(pred, gt)
-
-        # 光谱重建损失
-        pred_spec = self.spec_conv(pred)
-        gt_spec = self.spec_conv(gt)
-        loss_spec = self.mse(pred_spec, gt_spec)
-
-        # 总损失
-        total_loss = self.alpha * loss_mse + self.beta * loss_spec + self.gamma * cesr_loss
-        return total_loss, loss_mse, loss_spec, cesr_loss
-
-
-# ===================== 最终DRTnet 主网络 =====================
+#################################################################
 class DRTnet(nn.Module):
     def __init__(self,
-                 scale_ratio=4,
-                 n_bands=102,  # HSI波段数
-                 msi_bands=4,  # MSI波段数
-                 dim=64,  # 基础通道数
-                 depth=3,  # DRT层数
-                 heads=8):
-        super().__init__()
+                 arch,
+                 scale_ratio,
+                 n_select_bands,
+                 n_bands,
+                 dataset=None
+                 ):
+        """Load the pretrained ResNet and replace top fc layer."""
+        super(DRTnet, self).__init__()
+
         self.scale_ratio = scale_ratio
+        self.n_bands = n_bands
+        self.arch = arch
+        self.n_select_bands = n_select_bands
+        self.weight = nn.Parameter(torch.tensor([0.5]))
 
-        # 1. 输入投影
-        self.hsi_proj = nn.Conv2d(n_bands, dim, 3, padding=1)
-        self.msi_proj = nn.Conv2d(msi_bands, dim, 3, padding=1)
+        self.conv_fus = nn.Sequential(
+            nn.Conv2d(n_bands, n_bands, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+        )
+        self.conv_spat = nn.Sequential(
+            nn.Conv2d(n_bands, n_bands, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+        )
+        self.conv_spec = nn.Sequential(
+            nn.Conv2d(n_bands, n_bands, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+        )
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(n_select_bands, n_bands, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+        )
+        self.D1 = nn.Sequential(
+            nn.Conv2d(n_select_bands, 48, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(48, 48, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(48, n_bands, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(n_bands, n_bands, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
 
-        # 2. 核心DRT双分支矩形Transformer
-        self.drt = DRT(dim=dim, h=192, w=192, depth=depth, heads=heads)
+        )
+        self.D2 = nn.Sequential(
+            nn.Conv2d(n_bands, 156, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(156, 156, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(156, n_bands*2, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(n_bands*2, n_bands*2, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+        )
+        #Pavia(n_bands*3-2) PaviaU(n_bands*3-1)
 
-        # 3. SAFA尺度自适应特征聚合
-        self.safa = SAFA(dim=dim)
+        if dataset == 'Pavia':
+            u1_channel = n_bands*3-2
+        elif dataset == 'PaviaU':
+            u1_channel = n_bands * 3 - 1
+        elif dataset == 'Botswana':
+            u1_channel = n_bands * 3 - 3
+        elif dataset == 'Urban':
+            u1_channel = n_bands * 3 - 2
+        elif dataset == 'DC':
+            u1_channel = n_bands * 3-1
+        elif dataset == 'Augsburg':
+            u1_channel = n_bands * 3-3
+        elif dataset == 'Cave21':
+            u1_channel = n_bands * 3-1
 
-        # 4. CESR对比增强光谱恢复
-        self.cesr = CESR(dim=dim)
+        self.U1 = nn.Sequential(
+            # print(u1_channel,n_bands),
+            nn.Conv2d(u1_channel, n_bands*2, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(n_bands*2, n_bands*1, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            # nn.Upsample(scale_factor=2, mode='nearest'),
+        )
 
-        # 5. 输出重建
-        self.out_conv = nn.Conv2d(dim, n_bands, 3, padding=1)
+        # Pavia(n_bands*2) PaviaU(n_bands*2-2)
+        if dataset == 'Pavia':
+            self.u2_channel = n_bands * 2
+        elif dataset == 'PaviaU':
+            self.u2_channel = n_bands * 2 - 2
+        elif dataset == 'Botswana':
+            self.u2_channel = n_bands * 2 - 2
+        elif dataset == 'Urban':
+            self.u2_channel = n_bands * 2
+        elif dataset == 'DC':
+            self.u2_channel = n_bands*2-2
+        elif dataset == 'Augsburg':
+            self.u2_channel = n_bands*2-2
+        elif dataset == 'Cave21':
+            self.u2_channel = n_bands*2 -2
+        self.U2 = nn.Sequential(
+            nn.Conv2d( self.u2_channel, n_bands, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+
+        )
+
+        self.conv3 = nn.Sequential(  #n_bands * 3
+            nn.Conv2d(n_bands*2+5, n_bands, kernel_size=3, stride=1, padding=1), # nn.Conv2d(n_bands*2+5, n_bands, kernel_size=3, stride=1, padding=1),  # 11.04
+            nn.ReLU(),
+            nn.Conv2d(n_bands, n_bands, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+        )
+
+        self.transformer1 = TransformerModel_rectangle(  #TransformerModel_rectangle(  # 消融
+            map_size=8,  # 8 11.1 256:16  CAVE:32
+            M_channel = n_bands*2,
+            dim=32,  # 128 11.4
+            depth=5,
+            heads=8,
+            mlp_dim=n_bands,
+            dropout_rate=0.1,
+            attn_dropout_rate=0.1,
+        )
+        self.transformer2 = TransformerModel_rectangle(  #TransformerModel_rectangle(  # 消融
+            map_size =32 ,  # 32 64  11.04  256:64  CAVE:
+            M_channel=n_bands,
+            dim=64,  # 64 11.04
+            depth=5,
+            heads=8,
+            mlp_dim=n_bands,
+            dropout_rate=0.1,
+            attn_dropout_rate=0.1
+        )
+
+        self.ca = ChannelAttention(2 * n_bands)
+        self.ca1 = ChannelAttention( n_bands)
+        self.sa = SpatialAttention()
+        # self.decoder1 = DecoderBlock(n_bands*6, n_bands*6, nn.BatchNorm2d)
+        # self.decoder2 = DecoderBlock(n_bands * 4, n_bands * 4, nn.BatchNorm2d)
+        # self.decoder3 = DecoderBlock(n_bands * 1, n_bands * 1, nn.BatchNorm2d)
+        self.decoder1 = CGCconv(self.n_bands * 6, u1_channel, dataset, dim=1024)  # out: u1_channel
+        self.decoder2 = CGCconv(self.n_bands * 4,self.u2_channel,dataset, dim=256)
+
+        # 11.04
+        self.convf1 = nn.Conv2d(u1_channel, u1_channel, kernel_size=3, stride=1, padding=1)  # self.n_bands * 6
+        # self.convf1 = nn.Conv2d(self.n_bands * 6, u1_channel, kernel_size=3, stride=1, padding=1)  # GRB 消融
+        self.convf2 = nn.Conv2d(self.n_bands * 4, self.u2_channel, kernel_size=3, stride=1, padding=1)   # GRB 消融
+
+        self.multi_scale_instance = MultiScaleFusion_Pooling(n_bands*2+5, pool_sizes,n_bands*2+5 )
+
+    def lrhr_interpolate(self, x_lr, x_hr):
+        x_lr = F.interpolate(x_lr, scale_factor=self.scale_ratio, mode='bilinear')
+        gap_bands = self.n_bands / (self.n_select_bands - 1.0)
+        for i in range(0, self.n_select_bands - 1):
+            x_lr[:, int(gap_bands * i), ::] = x_hr[:, i, ::]
+        x_lr[:, int(self.n_bands - 1), ::] = x_hr[:, self.n_select_bands - 1, ::]
+
+        return x_lr
+
+    def spatial_edge(self, x):
+        edge1 = x[:, :, 0:x.size(2) - 1, :] - x[:, :, 1:x.size(2), :]
+        edge2 = x[:, :, :, 0:x.size(3) - 1] - x[:, :, :, 1:x.size(3)]
+
+        return edge1, edge2
+
+    def spectral_edge(self, x):
+        edge = x[:, 0:x.size(1) - 1, :, :] - x[:, 1:x.size(1), :, :]
+
+        return edge
+
 
     def forward(self, x_lr, x_hr):
-        """
-        x_lr: 低分辨率高光谱 LR-HSI [B, n_bands, H/4, W/4]
-        x_hr: 高分辨率多光谱 HR-MSI [B, msi_bands, H, W]
-        """
-        # 上采样LR-HSI
-        x_lr_up = F.interpolate(x_lr, scale_factor=self.scale_ratio, mode='bicubic')
-
-        # 特征投影
-        hsi_feat = self.hsi_proj(x_lr_up)
-        msi_feat = self.msi_proj(x_hr)
-
-        # 1. DRT 双分支矩形Transformer
-        fuse_feat = self.drt(hsi_feat, msi_feat)
-
-        # 2. SAFA 尺度自适应聚合
-        fuse_feat = self.safa(fuse_feat)
-
-        # 3. CESR 对比增强 + 对比损失
-        fuse_feat, cesr_loss = self.cesr(fuse_feat, x_lr_up, x_hr)
-
-        # 最终重建
-        pred_hsi = self.out_conv(fuse_feat)
-
-        return pred_hsi, cesr_loss
 
 
-# ===================== 构建函数 =====================
-def make_drtnet():
-    return DRTnet(
-        scale_ratio=4,
-        n_bands=102,
-        msi_bands=4,
-        dim=64,
-        depth=3,
-        heads=8
-    )
+        if self.arch == 'DRTnet':
+
+            a = self.D1(x_hr)
+            a = a * self.ca1(a)
+            a = a*self.sa(a)
+
+            b = self.D2(a)
+            b = b * self.ca(b)
+            b = b * self.sa(b)
+
+            c = self.D2(x_lr)
+            c = c * self.ca(c)
+            c = c * self.sa(c)
+            d = F.interpolate(x_lr, scale_factor=4, mode='bilinear')
+            d = d * self.ca1(d)
+            d = d * self.sa(d)
+            # print('b,c',b.shape, c.shape, d.shape)
+#######################################################################################
+            transformer_results = self.transformer1(b, c)
+            # b(1,62,1,1),c(1,62,32,32),e (1,62,32,32)
+            e = transformer_results['z']
+            f1 = torch.cat((torch.cat((b,c), 1), e),1)
+            # print('f1',f1.shape)
+            f1 = self.decoder1(f1)
+            f1 = self.convf1(f1)  # 11.04
+            f1 = F.interpolate(f1, scale_factor=4, mode='bilinear')
+            #f1_channel = f1.shape[1]
+            # print('f1',f1.shape)  # f1 torch.Size([1, 308, 16, 16])
+            f1 = self.U1(f1)  #  torch.Size([1, 103, 32, 32])
+ ###################################################################################
+            transformer_results1 = self.transformer2(a,x_lr)
+            g = transformer_results1['z']
+            f2 = torch.cat((torch.cat((a,x_lr),1),g),1)
+            # print('f1,f2',f2.shape,f1.shape)  # f2 torch.Size([1, 309, 32, 32])
+            f2 = torch.cat((f2,f1),1)
+            # print('f2', f2.shape)  # f2 torch.Size([1, 412, 32, 32])
+            f2 = self.decoder2(f2)
+            # f2 = self.convf2(f2)  # GRB 消融
+            f2 = F.interpolate(f2, scale_factor=4, mode='bilinear')
+
+            f2 = self.U2(f2)
+
+            x = torch.cat((f2, x_hr), 1)
+            x = torch.cat((x, d), 1)   # n_bands*2+3
+###################################################################################多实例部分
+            x = self.multi_scale_instance(x)
+            # x =
 
 
-if __name__ == '__main__':
-    model = make_drtnet()
-    print(model)
-    # 测试输入
-    lr_hsi = torch.randn(1, 102, 48, 48)
-    hr_msi = torch.randn(1, 4, 192, 192)
-    out, cesr_loss = model(lr_hsi, hr_msi)
-    print(f"输出形状: {out.shape}")
+###################################################################################
+            x = self.conv3(x)
+            x_spat = x + self.conv_spat(x)
+            spat_edge1, spat_edge2 = self.spatial_edge(x_spat)
+
+            x_spec = x_spat + self.conv_spec(x_spat)
+            spec_edge = self.spectral_edge(x_spec)
+
+            x = x_spec
+        return x, x_spat,  #x_spec, spat_edge1, spat_edge2, spec_edge
