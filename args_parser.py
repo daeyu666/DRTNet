@@ -17,7 +17,7 @@ def args_parser():
     parser.add_argument('-root', type=str, default='./data')
     parser.add_argument('-dataset', type=str, default='Urban',
                         choices=['PaviaU', 'Botswana', 'KSC', 'Urban', 'Pavia', 'IndianP', 'Washington','MUUFL_HSI','salinas_corrected','Houston13']) # Houston_HSI
-    parser.add_argument('--scale_ratio', type=float, default=4)
+    parser.add_argument('--scale_ratio', type=int, default=4)
     parser.add_argument('--n_bands', type=int, default=0)  # # 数据集的光谱波段数
     parser.add_argument('--n_select_bands', type=int, default=5)
 
