@@ -9,7 +9,7 @@ def args_parser():
                             'SpatCNN', 'SpecCNN',
                             'SpatRNET', 'SpecRNET',
                             # the proposed method
-                            'SSRNET','MCT'
+                            'SSRNET', 'MCT',
                             # these five models are used for comparison experiments
                             'SSFCNN', 'ConSSFCNN',
                             'TFNet', 'ResTFNet',
