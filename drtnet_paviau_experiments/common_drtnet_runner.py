@@ -77,6 +77,9 @@ def _patch_no_contrast(main_mod) -> None:
         epoch,
         n_epochs,
     ):
+        l1 = torch.nn.L1Loss()
+        if torch.cuda.is_available():
+            l1 = l1.cuda()
         return main_mod.train(
             train_list,
             image_size,
@@ -86,6 +89,7 @@ def _patch_no_contrast(main_mod) -> None:
             model,
             optimizer,
             criterion,
+            l1,
             epoch,
             n_epochs,
         )
