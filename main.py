@@ -7,7 +7,7 @@ from models.MIMO import MIMO
 from models.SSRNET import SSRNET
 from models.SingleCNN import SpatCNN, SpecCNN
 from models.SSFCNN import SSFCNN, ConSSFCNN
-from models.DRTNet import DRTnet
+from models.MCT_rectangle import MCT_rectangle
 from utils import *
 from data_loader import build_datasets
 from validate import validate
@@ -78,13 +78,13 @@ def main():
                         args.n_select_bands,
                         args.n_bands).cuda()
 
-    elif args.arch == 'DRTnet':
-        model = DRTnet(args.arch,
-                       args.scale_ratio,
-                       args.n_select_bands,
-                       args.n_bands,
-                       args.dataset,
-                       ).cuda()
+    elif args.arch in ('DRTnet', 'DRTnet_GSIS', 'no_contrast'):
+        model = MCT_rectangle(args.arch,
+                              args.scale_ratio,
+                              args.n_select_bands,
+                              args.n_bands,
+                              args.dataset,
+                              ).cuda()
 
     elif args.arch == 'MIMO':
         model = MIMO(args.n_select_bands, args.n_bands).cuda()
