@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class SKConv(nn.Module):
@@ -14,7 +13,6 @@ class SKConv(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Conv2d(inplanes, d, 1, bias=False),
-            nn.BatchNorm2d(d),
             nn.ReLU(inplace=True),
         )
         self.fcs = nn.ModuleList([
