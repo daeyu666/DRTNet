@@ -124,7 +124,7 @@ def main():
 
     # Loss and Optimizer
     criterion = nn.MSELoss().cuda()
-    contrast_loss = torch.nn.CrossEntropyLoss().cuda()
+    contrast_loss = None
 
     best_psnr = 0
     best_psnr = validate(test_list,
