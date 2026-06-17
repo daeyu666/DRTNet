@@ -7,6 +7,7 @@ from models.SSRNET import SSRNET
 from models.SingleCNN import SpatCNN, SpecCNN
 from models.SSFCNN import SSFCNN, ConSSFCNN
 from models.MCT_rectangle import MCT_rectangle
+from models.baseline import baseline
 from utils import *
 from data_loader import build_datasets
 from validate import validate
@@ -85,6 +86,14 @@ def main():
                               args.dataset,
                               ).cuda()
 
+    elif args.arch == 'baseline':
+        model = baseline(args.arch,
+                         args.scale_ratio,
+                         args.n_select_bands,
+                         args.n_bands,
+                         args.dataset,
+                         ).cuda()
+
     elif args.arch == 'MIMO':
         from models.MIMO import MIMO
         model = MIMO(args.n_select_bands, args.n_bands).cuda()
@@ -124,6 +133,7 @@ def main():
 
     # Loss and Optimizer
     criterion = nn.MSELoss().cuda()
+    L1 = nn.L1Loss().cuda()
     contrast_loss = None
 
     best_psnr = 0
@@ -140,19 +150,32 @@ def main():
 
     for epoch in range(args.n_epochs):
         print('Train_Epoch_{}: '.format(epoch))
-        E = Moco(base_encoder=model, image_lr=image_lr, image_hr=image_hr).cuda()
-        train_contrast(train_list,
-                       args.image_size,
-                       args.scale_ratio,
-                       args.n_bands,
-                       args.arch,
-                       model,
-                       E,
-                       optimizer,
-                       criterion,
-                       contrast_loss,
-                       epoch,
-                       args.n_epochs)
+        if getattr(model, 'uses_contrastive_learning', True):
+            E = Moco(base_encoder=model, image_lr=image_lr, image_hr=image_hr).cuda()
+            train_contrast(train_list,
+                           args.image_size,
+                           args.scale_ratio,
+                           args.n_bands,
+                           args.arch,
+                           model,
+                           E,
+                           optimizer,
+                           criterion,
+                           contrast_loss,
+                           epoch,
+                           args.n_epochs)
+        else:
+            train(train_list,
+                  args.image_size,
+                  args.scale_ratio,
+                  args.n_bands,
+                  args.arch,
+                  model,
+                  optimizer,
+                  criterion,
+                  L1,
+                  epoch,
+                  args.n_epochs)
 
         print('Val_Epoch_{}: '.format(epoch))
         recent_psnr = validate(test_list,
