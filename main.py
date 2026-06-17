@@ -8,6 +8,7 @@ from models.SingleCNN import SpatCNN, SpecCNN
 from models.SSFCNN import SSFCNN, ConSSFCNN
 from models.MCT_rectangle import MCT_rectangle
 from models.baseline import baseline
+from models.transformer_baseline import transformer_baseline
 from utils import *
 from data_loader import build_datasets
 from validate import validate
@@ -93,6 +94,14 @@ def main():
                          args.n_bands,
                          args.dataset,
                          ).cuda()
+
+    elif args.arch == 'transformer_baseline':
+        model = transformer_baseline(args.arch,
+                                     args.scale_ratio,
+                                     args.n_select_bands,
+                                     args.n_bands,
+                                     args.dataset,
+                                     ).cuda()
 
     elif args.arch == 'MIMO':
         from models.MIMO import MIMO
