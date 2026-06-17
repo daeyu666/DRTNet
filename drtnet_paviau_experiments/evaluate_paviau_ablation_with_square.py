@@ -5,6 +5,7 @@ import csv
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import scipy.io as scio
@@ -21,16 +22,24 @@ if str(PROJECT_ROOT) not in sys.path:
 from data_loader import build_datasets
 from metrics import calc_ergas, calc_psnr, calc_rmse, calc_sam, mrae
 from models.MCT_rectangle import MCT_rectangle
-from drtnet_paviau_experiments.common_drtnet_runner import _patch_multiscale_pooling_to_single_scale
+from drtnet_paviau_experiments.common_drtnet_runner import _patch_safa_to_single_scale
 from drtnet_paviau_experiments.square_transformer_utils import replace_with_square_window_transformers
 
 
 EXPERIMENTS = [
     ("01_drt_normal", "DRT + rectangle transformer + SAFA + CESR", "rectangle"),
-    ("02_drt_safa_single_scale", "DRT + rectangle transformer + single-scale SAFA + CESR", "single_scale_safa"),
+    (
+        "02_drt_single_scale_no_downsample",
+        "DRT + rectangle transformer + current-resolution single-scale branch + CESR",
+        "single_scale_safa",
+    ),
     ("03_drt_no_contrast", "DRT + rectangle transformer + SAFA, no CESR", "rectangle"),
     ("04_drt_square_transformer", "DRT + square-window transformer + SAFA + CESR", "square_transformer"),
 ]
+
+CHECKPOINT_ALIASES = {
+    "02_drt_single_scale_no_downsample": ["02_drt_safa_single_scale", "02_drt_single_scale_safa"],
+}
 
 
 def parse_pixels(values):
@@ -56,37 +65,38 @@ def center_crop_offset(root, image_size, scale_ratio):
     return (width - image_size) // 2, (height - image_size) // 2
 
 
-def apply_single_scale_safa(model):
-    patched = []
-    for module_name, module in model.named_modules():
-        signature = "{} {}".format(module_name, module.__class__.__name__).lower()
-        if (
-            "safa" in signature
-            or "multiscale" in signature
-            or "multi_scale" in signature
-            or ("scale" in signature and "pool" in signature)
-            or ("scale" in signature and "fusion" in signature)
-            or ("scale" in signature and "aggregation" in signature)
-        ):
-            _patch_multiscale_pooling_to_single_scale(module)
-            if getattr(module, "_drtnet_single_scale_forward", False):
-                patched.append(module_name or module.__class__.__name__)
-    print("Single-scale SAFA modules:", patched)
+def build_single_scale_safa_model():
+    namespace = SimpleNamespace(MCT_rectangle=MCT_rectangle)
+    _patch_safa_to_single_scale(namespace)
+    return namespace.MCT_rectangle("DRTnet", 4, 5, 103, "PaviaU")
 
 
 def build_model(mode):
-    model = MCT_rectangle("DRTnet", 4, 5, 103, "PaviaU")
     if mode == "single_scale_safa":
-        apply_single_scale_safa(model)
-    elif mode == "square_transformer":
+        model = build_single_scale_safa_model()
+    else:
+        model = MCT_rectangle("DRTnet", 4, 5, 103, "PaviaU")
+
+    if mode == "square_transformer":
         replace_with_square_window_transformers(model)
         print("Square-window transformer evaluation active: transformer1 8x8, transformer2 12x12")
-    elif mode != "rectangle":
+    elif mode not in ("rectangle", "single_scale_safa"):
         raise ValueError("Unknown model mode: {}".format(mode))
 
     if torch.cuda.is_available():
         model = model.cuda()
     return model
+
+
+def find_checkpoint(run_root, exp_name):
+    names = [exp_name] + CHECKPOINT_ALIASES.get(exp_name, [])
+    for name in names:
+        checkpoint = run_root / name / "best_PaviaU_DRTnet.pkl"
+        if checkpoint.exists():
+            if name != exp_name:
+                print("Using legacy checkpoint directory for {}: {}".format(exp_name, name))
+            return checkpoint
+    return run_root / exp_name / "best_PaviaU_DRTnet.pkl"
 
 
 def load_checkpoint(model, checkpoint_path):
@@ -190,7 +200,7 @@ def main():
     outputs = {}
     ref_chw = None
     for exp_name, description, mode in EXPERIMENTS:
-        checkpoint = run_root / exp_name / "best_PaviaU_DRTnet.pkl"
+        checkpoint = find_checkpoint(run_root, exp_name)
         if not checkpoint.exists():
             print("Skip missing checkpoint:", checkpoint)
             continue
