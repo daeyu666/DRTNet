@@ -9,6 +9,7 @@ def args_parser():
                             'SpatCNN', 'SpecCNN',
                             'SpatRNET', 'SpecRNET',
                             'SSRNET', 'MCT', 'DRTnet', 'DRTnet_GSIS', 'no_contrast',
+                            'baseline',
                             'SSFCNN', 'ConSSFCNN',
                             'TFNet', 'ResTFNet',
                             'MSDCNN'
